@@ -27,7 +27,17 @@ namespace Grouping
             Console.WriteLine("人数(N)・ラウンド数(R)・乱数シード(seed)を順に入力してください。");
             Console.WriteLine("※ EnterだけでN=54, R=3、seedはランダムになります。\n");
 
-            int N = ReadInt("人数　(3以上推奨) [既定=54]", min: 3, max: int.MaxValue, defaultValue: 54);
+            int N;
+            while (true)
+            {
+                N = ReadInt("人数　(4以上・7不可) [既定=54]", min: 4, max: int.MaxValue, defaultValue: 54);
+                if (N == 7)
+                {
+                    Console.WriteLine("※ 7人では4〜6人編成の条件を満たせません。別の人数を入力してください。\n");
+                    continue;
+                }
+                break;
+            }
             int R = ReadInt("ラウンド数 (1以上) [既定=3]", min: 1, max: int.MaxValue, defaultValue: 3);
             int? seed = ReadOptionalSeed("乱数シード 　桁数の制限はありません。（未入力=ランダム）[例: 12345]");
 
@@ -100,12 +110,13 @@ namespace Grouping
         }
 
         /// <summary>
-        /// N人をRラウンド分、各ラウンドで3〜6人のグループに分割した結果を返す。
+        /// N人をRラウンド分、各ラウンドで4〜6人のグループに分割した結果を返す。
         /// 同一グループ(完全一致)や5-core(6人組内の5人)の再出現をできるだけ回避。
         /// </summary>
         public List<List<List<int>>> GenerateAllRounds(int N, int R)
         {
-            if (N < 3) throw new ArgumentException("N must be >= 3");
+            if (N < 4) throw new ArgumentException("N must be >= 4");
+            if (N == 7) throw new ArgumentException("N cannot be 7 when restricting groups to 4-6 people.");
             if (R < 1) throw new ArgumentException("R must be >= 1");
 
             var allRounds = new List<List<List<int>>>();
@@ -176,7 +187,7 @@ namespace Grouping
 
         /// <summary>
         /// シャッフル済みのID列から先頭5つずつグループ化し、余りを返す。
-        /// ここでは「5人組のみ」を作り、サイズ3〜6の調整は余り処理で行う。
+        /// ここでは「5人組のみ」を作り、サイズ4〜6の調整は余り処理で行う。
         /// </summary>
         private static (List<List<int>> groups, List<int> remainder) ChunkByFive(List<int> ids)
         {
@@ -196,43 +207,39 @@ namespace Grouping
         }
 
         /// <summary>
-        /// 余りメンバーを既存の5人組へ合流(6人上限)させる or 独立グループで確定する。
-        /// ・r=0: 何もしない
-        /// ・r=1/2: 既存5人組へ均等合流(満杯が多いときは救済で新規3人組を作る)
-        /// ・r=3/4: 余りのみで独立グループ
-        /// ・r=8/9: 5人 + (3 or 4) に分割(安全弁; 現行の切り出しでは通常は出ない)
-        /// ・その他: 3〜6に収まるよう貪欲にまとめる(将来拡張の保険)
+        /// 余りメンバーを既存のグループへ合流(最大6人)させるか、4〜6人の独立グループとして確定する。
         /// </summary>
         private void DistributeRemainder(List<List<int>> groups, List<int> remainder, int extraStart)
         {
             int r = remainder.Count;
             if (r == 0) return; // 余りなし
 
-            // 特例: groups が空(= N < 5 のケースなど)では、3〜6のいずれかにちょうど合えばそのまま作る
+            // groups が空(= N が 5未満のケース等)では、余りだけで4〜6人に分割できるか確認
             if (groups.Count == 0)
             {
-                if (r == 3 || r == 4 || r == 5 || r == 6)
+                if (!TrySplitIntoValidGroups(remainder, out var initialGroups))
                 {
-                    groups.Add(new List<int>(remainder));
-                    return;
+                    throw new InvalidOperationException("Cannot split members into 4-6 sized groups.");
                 }
-                // ここに来る r は(通常運用では)想定外だが、下の switch/default でフォールバックする
+                foreach (var g in initialGroups)
+                {
+                    groups.Add(g);
+                }
+                return;
             }
 
             switch (r)
             {
                 case 1:
                 case 2:
-                    // 余り1/2人は、既存5人組に「6人を超えない範囲」で均等合流
-                    // ptr は合流開始位置で、ラウンドごとに extraStart により回す
                     int ptr = extraStart % Math.Max(1, groups.Count);
+                    var unplaced = new List<int>();
 
                     foreach (var member in remainder)
                     {
                         int attempts = 0;
                         bool placed = false;
 
-                        // 全グループを最大1周して空き(6人未満)を探す
                         while (attempts < groups.Count)
                         {
                             var g = groups[ptr];
@@ -240,7 +247,7 @@ namespace Grouping
                             {
                                 g.Add(member);
                                 placed = true;
-                                ptr = (ptr + 1) % groups.Count; // 次の合流先をずらす
+                                ptr = (ptr + 1) % groups.Count;
                                 break;
                             }
                             ptr = (ptr + 1) % groups.Count;
@@ -249,71 +256,116 @@ namespace Grouping
 
                         if (!placed)
                         {
-                            // すべて満杯(=全て6人)のような例外的状況:
-                            // 新規3人組を作るために、人数の多いグループから2人借りる救済を試みる
-                            var newGroup = new List<int> { member };
+                            unplaced.Add(member);
+                        }
+                    }
 
-                            // グループを人数降順に並べ、末尾から1人ずつ借りる
-                            var candidates = groups
-                                .Select((g, i) => (g, i))
-                                .OrderByDescending(t => t.g.Count)
-                                .ToList();
-
-                            foreach (var (g, idx) in candidates)
-                            {
-                                if (newGroup.Count >= 3) break; // 3人に達したら終了
-                                if (g.Count > 3)               // 借り元も3人未満にならないように
-                                {
-                                    newGroup.Add(g[^1]);       // 末尾を1人借りる
-                                    g.RemoveAt(g.Count - 1);
-                                }
-                            }
-
-                            // 3〜6に収まれば採用、収まらなければ一旦追加(後続の修復で整える)
-                            if (newGroup.Count >= 3 && newGroup.Count <= 6)
-                            {
-                                groups.Add(newGroup);
-                            }
-                            else
-                            {
-                                groups.Add(newGroup); // 最終手段(後でFixConflictsが対処)
-                            }
+                    if (unplaced.Count > 0)
+                    {
+                        if (!TryCreateGroupByBorrowing(groups, unplaced, 4))
+                        {
+                            throw new InvalidOperationException("Unable to distribute remainder without violating size constraints.");
                         }
                     }
                     break;
 
                 case 3:
-                case 4:
-                    // 余りだけで独立グループ(サイズ要件クリア)
-                    groups.Add(new List<int>(remainder));
-                    break;
-
-                case 8:
-                case 9:
-                    // 安全弁: 5人 + (3 or 4) に分ける
-                    // (現行の 5人切り出し→余り では基本的に r は 0..4 に収まる想定)
-                    var g5 = remainder.Take(5).ToList();
-                    var g34 = remainder.Skip(5).ToList();
-                    groups.Add(g5);
-                    groups.Add(g34);
+                    if (!TryCreateGroupByBorrowing(groups, remainder, 4))
+                    {
+                        throw new InvalidOperationException("Unable to form a 4-person group from the remainder.");
+                    }
                     break;
 
                 default:
-                    // フォールバック: 3〜6に収まるように貪欲に詰めていく
-                    // (将来「5人切り出し」以外の戦略を導入した場合の保険)
-                    int i = 0;
-                    while (i < remainder.Count)
+                    if (!TrySplitIntoValidGroups(remainder, out var newGroups))
                     {
-                        int left = remainder.Count - i;                 // 残り人数
-                        int take = Math.Min(6, Math.Max(3, left));      // 3〜6の範囲で可能なだけ取る
-                        // ※ take > left にならないよう left を上限にしている
-                        take = Math.Min(take, left);
+                        throw new InvalidOperationException("Cannot split members into 4-6 sized groups.");
+                    }
 
-                        groups.Add(remainder.GetRange(i, take));
-                        i += take;
+                    foreach (var g in newGroups)
+                    {
+                        groups.Add(g);
                     }
                     break;
             }
+        }
+
+        /// <summary>
+        /// 余りメンバーからターゲット人数の新規グループを作るため、既存グループからメンバーを借りる。
+        /// 借り元のグループは4人未満にならないようにする。
+        /// </summary>
+        private bool TryCreateGroupByBorrowing(List<List<int>> groups, List<int> seedMembers, int targetSize)
+        {
+            var newGroup = new List<int>(seedMembers);
+            var borrowed = new List<(List<int> group, int member)>();
+
+            var donors = groups
+                .OrderByDescending(g => g.Count)
+                .ToList();
+
+            foreach (var g in donors)
+            {
+                while (newGroup.Count < targetSize && g.Count > 4)
+                {
+                    int member = g[^1];
+                    g.RemoveAt(g.Count - 1);
+                    newGroup.Add(member);
+                    borrowed.Add((g, member));
+                }
+
+                if (newGroup.Count == targetSize) break;
+            }
+
+            if (newGroup.Count == targetSize)
+            {
+                groups.Add(newGroup);
+                return true;
+            }
+
+            foreach (var (group, member) in borrowed)
+            {
+                group.Add(member);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// リストの人数を4〜6人のグループへ分割する。成功時は新しいリストを返す。
+        /// </summary>
+        private static bool TrySplitIntoValidGroups(List<int> members, out List<List<int>> groups)
+        {
+            var sizes = new List<int>();
+            if (!TrySplitIntoValidSizes(members.Count, sizes))
+            {
+                groups = new List<List<int>>();
+                return false;
+            }
+
+            groups = new List<List<int>>(sizes.Count);
+            int index = 0;
+            foreach (var size in sizes)
+            {
+                groups.Add(members.GetRange(index, size));
+                index += size;
+            }
+            return true;
+        }
+
+        private static bool TrySplitIntoValidSizes(int remaining, List<int> sizes)
+        {
+            if (remaining == 0) return true;
+
+            foreach (var size in new[] { 6, 5, 4 })
+            {
+                if (remaining >= size)
+                {
+                    sizes.Add(size);
+                    if (TrySplitIntoValidSizes(remaining - size, sizes)) return true;
+                    sizes.RemoveAt(sizes.Count - 1);
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -406,14 +458,14 @@ namespace Grouping
 
         /// <summary>
         /// 単一グループについて、以下のいずれかに該当すれば衝突(true)と判定:
-        /// ・サイズ違反(3未満 or 6超過)
+        /// ・サイズ違反(4未満 or 6超過)
         /// ・過去に完全一致で出たグループ(_historyExactに存在)
         /// ・6人組のとき、その中の任意5人(6通り)が過去に出た5人組(_historyFiveCoreに存在)
         /// </summary>
         private bool IsConflict(List<int> g)
         {
-            // サイズ制約 (3〜6)
-            if (g.Count < 3 || g.Count > 6) return true;
+            // サイズ制約 (4〜6)
+            if (g.Count < 4 || g.Count > 6) return true;
 
             // 完全一致の再出現チェック
             var key = KeyOf(g);
